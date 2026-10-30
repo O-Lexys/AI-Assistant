@@ -14,14 +14,22 @@
   ... --protocol НАЗВА [--dry]   виконати протокол (сценарій) або лише показати кроки
   ... --forget        очистити історію розмови
 
+Розділи файлу (шукай за заголовком «# ====»): конфігурація · утиліти · керування системою і локальні команди · протоколи й режими ·
+запис звуку · озвучення і голоси · оверлей (процес, талісман, відео й меми) · розпізнавання · LLM · оркестрація (демон, воркер) · CLI.
+
 Налаштування — у config.toml (див. README.txt); змінні середовища ASSISTANT_* мають вищий пріоритет.
 """
 import argparse, base64, difflib, json, math, os, queue, random, re, shlex, shutil, signal, socket, subprocess, sys
-import threading, time, tomllib, unicodedata, warnings
+import importlib.util, threading, time, tomllib, unicodedata, warnings
 warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# У фоновому слухачі BLAS/OpenMP створюють по потоку на ядро й нічого не дають: обмежуємо (воркер із whisper — без обмежень)
+if "--worker" not in sys.argv:
+    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(_v, "2")
 
 import numpy as np
 
@@ -60,7 +68,7 @@ CONFIG_KEYS = {
     "voice.enabled": "TTS", "voice.speaker": "PIPER_SPEAKER", "voice.speed": "PIPER_SPEED", "voice.model_path": "PIPER_MODEL",
     "voice.cloud": "ASSISTANT_TTS_CLOUD", "voice.output": "ASSISTANT_OUTPUT", "voice.mic_name": "ASSISTANT_MIC_NAME",
     "voice.mic_mix": "ASSISTANT_MIC_MIX", "voice.api_url": "ASSISTANT_TTS_URL", "voice.api_model": "ASSISTANT_TTS_MODEL",
-    "ui.enabled": "ASSISTANT_UI", "ui.scale": "ASSISTANT_UI_SCALE", "ui.style": "ASSISTANT_UI_STYLE",
+    "ui.enabled": "ASSISTANT_UI", "ui.command": "ASSISTANT_UI_CMD", "ui.scale": "ASSISTANT_UI_SCALE", "ui.style": "ASSISTANT_UI_STYLE",
     "ui.idle": "ASSISTANT_UI_IDLE", "ui.look": "ASSISTANT_UI_LOOK", "ui.move": "ASSISTANT_UI_MOVE", "ui.bubble": "ASSISTANT_UI_BUBBLE",
     "screen.max_side": "ASSISTANT_SCREEN_MAX", "vision.url": "ASSISTANT_VISION_URL", "vision.key": "ASSISTANT_VISION_KEY",
     "vision.key_file": "ASSISTANT_VISION_KEY_FILE", "vision.model": "ASSISTANT_VISION_MODEL",
@@ -76,6 +84,7 @@ def config_files():
     return ([Path(env).expanduser()] if env else []) + [SCRIPT_DIR / "config.toml", CFG / "config.toml"]
 
 _CFG_VOICES = {}
+_CFG_PLUGINS = {}                                   # [plugins] disabled = [...] та [plugins.назва] — налаштування плагінів
 
 def load_config():
     """Пріоритет: змінні середовища > config.toml > типові значення. -> (шлях, [apps], [aliases], [modes], [protocols])"""
@@ -97,6 +106,8 @@ def load_config():
                 modes = {k: dict(v) for k, v in values.items() if isinstance(v, dict)}
             elif section == "protocols":
                 protocols = {k: dict(v) for k, v in values.items() if isinstance(v, dict)}
+            elif section == "plugins":
+                _CFG_PLUGINS.update(values)
             elif section == "voices":
                 _CFG_VOICES.update({k: dict(v) for k, v in values.items() if isinstance(v, dict)})
             else:
@@ -179,10 +190,10 @@ UI_ON = _on("ASSISTANT_UI")
 UI_SCALE = float(E("ASSISTANT_UI_SCALE", "1.0"))
 UI_BANDS = 24
 UI_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right", "left", "right", "top", "bottom", "center", "cursor", "window")
-UI_STYLE = E("ASSISTANT_UI_STYLE", "mascot").strip().lower()    # mascot — персонаж-талісман; ring — коло з точок
+UI_CMD = E("ASSISTANT_UI_CMD", "").strip()                    # свій інтерфейс замість вбудованого талісмана (див. ПЛАГІНИ І СВІЙ ІНТЕРФЕЙС)
 UI_LOOK = E("ASSISTANT_UI_LOOK", "bot").strip().lower()          # bot — робот з очима; orb — чорна діра з точок і кільце-індикатор
-if UI_STYLE == "orb":                                            # сумісність: колишній style = "orb" (окремий GTK-орб) тепер — look = "orb"
-    UI_STYLE, UI_LOOK = "mascot", "orb"
+if E("ASSISTANT_UI_STYLE", "").strip().lower() in ("orb", "ring"):   # старий ключ ui.style: «ring»/«orb» тепер — вигляд orb
+    UI_LOOK = "orb"
 UI_IDLE = E("ASSISTANT_UI_IDLE", "show").strip().lower()        # show: талісман живе на екрані; hide: зʼявляється лише на розмову
 UI_MOVE = E("ASSISTANT_UI_MOVE", "follow").strip().lower()      # follow: біля активного вікна; wander: блукає; stay: стоїть
 UI_BUBBLE = _on("ASSISTANT_UI_BUBBLE")                          # відповідь у коміксній бульбашці замість сповіщення
@@ -485,6 +496,9 @@ def shell_tool(cmd, description="", background=False):
     head = "ok" if r.returncode == 0 else f"помилка: код {r.returncode}"
     return head + ("\n" + untrusted("вивід команди", out) if out else "")
 
+# Плагіни — це код, що виконується з правами користувача, тому модель не може ні читати, ні писати їх, сам скрипт і config.toml.
+PROTECTED_PATHS = [(SCRIPT_DIR / "plugins").resolve(), (SCRIPT_DIR / "assistant.py").resolve(), (SCRIPT_DIR / "config.toml").resolve()]
+
 def safe_path(p, must_exist=False):
     """Лише в домашній теці й не секрети. -> (Path, "") або (None, причина)."""
     p = str(p or "").strip()
@@ -497,6 +511,8 @@ def safe_path(p, must_exist=False):
     home = HOME.resolve()
     if q != home and home not in q.parents:
         return None, "шлях поза домашньою текою"
+    if any(q == x or x in q.parents for x in PROTECTED_PATHS):
+        return None, "це файл самого асистента (плагіни, скрипт, конфіг)"
     rel = q.relative_to(home).as_posix()
     if any(rel == x or rel.startswith(x + "/") for x in SECRET_PARTS) or SECRET_FILES.search(rel):
         return None, "це секретний файл"
@@ -883,9 +899,104 @@ if SHELL_MODE == "off":
 OAI_TOOLS = [{"type": "function", "function": {"name": t["name"], "description": t["description"],
                                               "parameters": t["input_schema"]}} for t in TOOLS]
 
+# ==============================================================================
+# ПЛАГІНИ: свої інструменти, голосові команди, реакції на події; свій інтерфейс — через UI_CMD
+# ==============================================================================
+
+PLUGIN_DIRS = [SCRIPT_DIR / "plugins", CFG / "plugins"]
+PLUGIN_TOOLS, PLUGIN_META, PLUGIN_CMDS, PLUGIN_HOOKS, PLUGINS_LOADED, PLUGIN_TRIGGERS = {}, {}, [], {}, [], []
+
+def emit(event, *args):
+    """Подія для плагінів: wake (почуто ключове слово), heard (текст команди), reply (відповідь), ui (кожна подія інтерфейсу)."""
+    for fn in PLUGIN_HOOKS.get(event, ()):
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f"  ⚠ плагін (подія {event}): {type(e).__name__}: {e}", file=sys.stderr)
+
+class PluginApi:
+    """Те, що плагін отримує у setup(api). Усе, що він реєструє, живе в процесі асистента."""
+    def __init__(self, name, cfg):
+        self.name, self.cfg = name, cfg                       # cfg — таблиця [plugins.<name>] з config.toml
+        self.state_dir = STATE / "plugins" / name             # місце для даних плагіна (створюється за потреби)
+        self.ui, self.notify = ui, notify                     # ui(t="bubble", text="…") — подія інтерфейсу; notify — сповіщення
+    def tool(self, name, description, params=None, fn=None, *, triggers=(), followup=False, clip="auto"):
+        """Інструмент для LLM. params — {"арг": "опис"} (рядки) або повна JSON-схема властивостей; fn(args: dict) -> текст.
+        triggers — слова/регулярки в запиті, за якими LLM отримує інструменти (інакше проста розмова їх не бачить).
+        followup=True: результат читає LLM і відповідає словами; інакше достатньо звуку clip. Можна як декоратор."""
+        def add(f):
+            props = {k: ({"type": "string", "description": v} if isinstance(v, str) else v) for k, v in (params or {}).items()}
+            schema = {"type": "object", "properties": props, "required": list(props)}
+            tool = {"name": name, "description": description, "input_schema": schema}
+            TOOLS.append(tool)
+            OAI_TOOLS.append({"type": "function", "function": {"name": name, "description": description, "parameters": schema}})
+            PLUGIN_TOOLS[name] = f
+            if triggers:
+                PLUGIN_TRIGGERS.append(re.compile("(" + "|".join(([triggers] if isinstance(triggers, str) else triggers)) + ")", re.I))
+            PLUGIN_META[name] = {"followup": followup, "clip": (None if followup else "готово") if clip == "auto" else clip}
+            return f
+        return add(fn) if fn else add
+    def command(self, pattern, fn=None, *, light=False):
+        """Голосова команда без LLM: pattern — регулярка (re.match по тексту малими літерами), fn(match, text, speaker) -> False,
+        якщо не оброблено. light=True — може виконуватись у легкому слухачі (швидко, без whisper); інакше у воркері."""
+        def add(f):
+            PLUGIN_CMDS.append((re.compile(pattern), f, light, self.name))
+            return f
+        return add(fn) if fn else add
+    def on(self, event, fn=None):
+        """Підписка на подію: wake / heard / reply / ui. Можна як декоратор."""
+        def add(f):
+            PLUGIN_HOOKS.setdefault(event, []).append(f)
+            return f
+        return add(fn) if fn else add
+
+def load_plugins():
+    """Завантажує *.py з plugins/ (поруч зі скриптом) і ~/.config/voice-assistant/plugins/. Файли на «_» пропускаються.
+    Кожен має функцію setup(api). Помилка в одному плагіні не заважає решті."""
+    off = set(_CFG_PLUGINS.get("disabled", []))
+    for d in PLUGIN_DIRS:
+        for f in (sorted(d.glob("*.py")) if d.is_dir() else []):
+            if f.stem.startswith("_") or f.stem in off or f.stem in PLUGINS_LOADED:
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(f"assistant_plugin_{f.stem}", f)
+                mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+                if not callable(getattr(mod, "setup", None)):
+                    print(f"  ⚠ плагін {f.name}: немає функції setup(api)", file=sys.stderr); continue
+                cfg = _CFG_PLUGINS.get(f.stem, {})
+                mod.setup(PluginApi(f.stem, cfg if isinstance(cfg, dict) else {}))
+                PLUGINS_LOADED.append(f.stem)
+            except Exception as e:
+                print(f"  ⚠ плагін {f.name} не завантажився: {type(e).__name__}: {e}", file=sys.stderr)
+    if PLUGINS_LOADED:
+        print(f"  🔌 плагіни: {', '.join(PLUGINS_LOADED)}", file=sys.stderr)
+
+def plugin_command(speaker, t, text, light):
+    """Голосові команди плагінів. -> True, якщо одну виконано (у пробному проході — якщо зрозуміли б)."""
+    for rx, fn, lt, name in PLUGIN_CMDS:
+        if light and not lt:
+            continue
+        m = rx.match(t)
+        if not m:
+            continue
+        if _DRY:
+            return True
+        try:
+            if fn(m, text, speaker) is not False:
+                return True
+        except Exception as e:
+            print(f"  ⚠ плагін {name}: {type(e).__name__}: {e}", file=sys.stderr)
+            speaker.clip("помилка"); return True
+    return False
+
 def run_tool(name, a):
     if _DRY:                                      # пробний прохід: лише перевірити, що команду розуміємо
         return "ok"
+    if name in PLUGIN_TOOLS:
+        try:
+            return str(PLUGIN_TOOLS[name](a) or "ok")
+        except Exception as e:
+            return f"помилка: {type(e).__name__}: {e}"
     if name == "open_app":
         argv = APPS.get(a.get("app", ""))
         if not argv:
@@ -1006,7 +1117,7 @@ SCREEN_RE = re.compile(E("ASSISTANT_SCREEN_RE", r"(екран|монітор|д�
 def _grim(extra):
     """Один знімок grim (JPEG) з повторами: інколи перший кадр порожній -> (bytes, "") або (None, причина)."""
     r = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
             r = subprocess.run(["grim", "-t", "jpeg", "-q", "80"] + extra + ["-"], capture_output=True, timeout=10)
         except Exception as e:
@@ -1260,6 +1371,8 @@ def local_command(speaker, text, light=False):
     t = re.sub(r"[’ʼ`]", "'", text.lower())
     t = re.sub(r"\s+", " ", re.sub(r"[.,!?…:;]+", " ", t)).strip()
     t = heal_music(t)
+    if PLUGIN_CMDS and plugin_command(speaker, t, text, light):
+        return True
     if voice_mode(speaker, t):
         return True
     def act(name, args, ok_clip):
@@ -1316,10 +1429,9 @@ def local_command(speaker, text, light=False):
         speaker.set_voice(name)
         speaker.say(f"Голос змінено. Це {voice_title(name)}.")
         return True
-    if media_state() or UI_STYLE == "mascot":
-        mc_ = media_local(t, light, speaker)
-        if mc_ is not None:
-            return mc_
+    mc_ = media_local(t, light, speaker)
+    if mc_ is not None:
+        return mc_
     sh = show_command(t)
     if sh:
         if light:
@@ -1970,7 +2082,7 @@ def ensure_virtual_mic():
     return _VMIC
 
 def remove_virtual_mic():
-    ok, mods = _pactl("list", "short", "modules")
+    _, mods = _pactl("list", "short", "modules")
     n = 0
     for line in reversed(mods.splitlines()):                 # спершу loopback і джерело, потім приймач
         f = line.split("\t")
@@ -2187,6 +2299,8 @@ _ui_sock = None
 def ui(**msg):
     """Подія для оверлею (fire-and-forget): {"s": "listen|think|speak|hide"}, {"t": "lv", "src", "b"}, {"t": "glyph", "g"}."""
     global _ui_sock
+    if PLUGIN_HOOKS.get("ui"):
+        emit("ui", msg)
     if not UI_ON:
         return False
     try:
@@ -2200,7 +2314,7 @@ def ui(**msg):
 
 def ui_say(text):
     """Те, що асистент говорить, — у коміксній бульбашці біля талісмана (речення з'являються в такт мовленню)."""
-    if UI_BUBBLE and UI_STYLE == "mascot" and text:
+    if UI_BUBBLE and text:
         t = clean(text).strip().rstrip(" ,;:")[:300]          # речення, обрізане по комі, не повинно закінчуватись комою
         if t:
             ui(t="bubble", text=t, add=True)
@@ -2359,8 +2473,6 @@ def _link_preview(url):
 
 def show_tool(a):
     """Показати щось на екрані поруч з талісманом: картку, картинку, превʼю сторінки, QR, коміксний ефект."""
-    if UI_STYLE != "mascot":
-        return "помилка: це працює лише зі стилем оверлею mascot ([ui] style)"
     kind = str(a.get("kind", "card")).strip().lower()
     if not UI_ON:
         return "помилка: оверлей вимкнено (ui.enabled або режим)"
@@ -2410,8 +2522,6 @@ def show_tool(a):
     return "помилка: невідомий вид"
 
 def mascot_tool(a):
-    if UI_STYLE != "mascot":
-        return "помилка: це працює лише зі стилем оверлею mascot ([ui] style)"
     act = str(a.get("action", "")).strip()
     if not UI_ON:
         return "помилка: оверлей вимкнено (ui.enabled або режим)"
@@ -2683,8 +2793,6 @@ def _ytdlp_fetch(query, kind):
 
 def play_media_tool(a):
     """Відео прямо в талісмані («телевізор») або трек з візуалізацією. source: пошуковий запит, посилання чи файл у домашній теці."""
-    if UI_STYLE != "mascot":
-        return "помилка: відео й треки працюють лише зі стилем оверлею mascot ([ui] style)"
     kind = "audio" if str(a.get("kind", "audio")).lower() == "audio" else "video"
     q = str(a.get("query") or a.get("source") or "").strip()
     if not UI_ON:
@@ -2751,7 +2859,7 @@ def _imgflip_templates():
 
 def meme_tool(a):
     """Мем на екрані. kind=random — свіжий із Reddit (без NSFW); kind=template — відомий шаблон з підписами top/bottom."""
-    if not UI_ON or UI_STYLE != "mascot":
+    if not UI_ON:
         return "помилка: оверлей вимкнено або style не mascot"
     if _DRY:
         return "ok"
@@ -2819,9 +2927,20 @@ class UiProc:
             notify("-u", "critical", "Асистент: оверлей не запускається", "Дивись помилку в терміналі; перевір: assistant.py --check")
             return
         if self.p is None or self.p.poll() is not None:
-            self._kill_stale()
-            self.p, self.t0 = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--ui"], stdin=subprocess.DEVNULL,
-                                               env={**os.environ, "ASSISTANT_UI_BOOT": state}), time.time()
+            if UI_CMD:                                  # свій інтерфейс: сам слухає сокет ASSISTANT_UI_SOCK (протокол — у README)
+                try:
+                    argv = [os.path.expanduser(x) for x in shlex.split(UI_CMD)]
+                    self.p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, cwd=str(HOME),
+                                              env={**os.environ, "ASSISTANT_UI_BOOT": state, "ASSISTANT_UI_SOCK": str(UI_SOCK)})
+                except OSError as e:
+                    self.broken = True
+                    print(f"Свій інтерфейс (ui.command) не запустився: {e}", file=sys.stderr)
+                    return
+                self.t0 = time.time()
+            else:
+                self._kill_stale()
+                self.p, self.t0 = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--ui"], stdin=subprocess.DEVNULL,
+                                                   env={**os.environ, "ASSISTANT_UI_BOOT": state}), time.time()
         else:
             ui(s=state)
     def hide(self):
@@ -2835,241 +2954,6 @@ class UiProc:
         if self.p is not None and self.p.poll() is None:
             self.p.terminate()
         ui_raw(t="quit")
-
-def run_overlay_ring(demo=False):
-    """Класичний оверлей (ui.style = "ring"): коло точок, що обертається. Слухає — реагує на голос як cava; думає — швидше при
-    навантаженні CPU; відповідає — реагує на голос асистента; усередині з'являються знаки."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
-    os.environ.setdefault("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1")
-    os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.services=false")   # без попередження про xdg-portal
-    try:
-        from PySide6.QtCore import Qt, QTimer, QSocketNotifier, QPointF, QRectF
-        from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath, QGuiApplication
-        from PySide6.QtWidgets import QApplication, QWidget
-    except Exception as e:
-        print(f"Оверлей: PySide6 не завантажився ({e}).\nНа NixOS додай у programs.nix-ld.libraries: "
-              "libGL libxkbcommon wayland fontconfig freetype dbus glib zstd", file=sys.stderr)
-        sys.exit(3)
-    S, R0, ND, NB = int(340 * UI_SCALE), 92 * UI_SCALE, 40, UI_BANDS
-
-    def draw_glyph(p, name, u, col):
-        pen = QPen(col, max(2.4, u * 0.13))
-        pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
-        p.setPen(pen); p.setBrush(Qt.NoBrush)
-        P = lambda x, y: QPointF(x * u, y * u)
-        Rc = lambda x, y, w, h: QRectF(x * u, y * u, w * u, h * u)
-        path = QPainterPath()
-        if name == "ok":
-            path.moveTo(P(-0.55, 0.05)); path.lineTo(P(-0.15, 0.45)); path.lineTo(P(0.6, -0.42))
-        elif name == "err":
-            path.moveTo(P(-0.45, -0.45)); path.lineTo(P(0.45, 0.45))
-            path.moveTo(P(0.45, -0.45)); path.lineTo(P(-0.45, 0.45))
-        elif name == "bang":
-            path.moveTo(P(0, -0.62)); path.lineTo(P(0, 0.1)); path.moveTo(P(0, 0.5)); path.lineTo(P(0, 0.52))
-        elif name == "ask":
-            path.arcMoveTo(Rc(-0.38, -0.68, 0.76, 0.76), 160)
-            path.arcTo(Rc(-0.38, -0.68, 0.76, 0.76), 160, -250)
-            path.lineTo(P(0, 0.2)); path.moveTo(P(0, 0.55)); path.lineTo(P(0, 0.57))
-        elif name == "open":
-            path.moveTo(P(-0.5, 0.5)); path.lineTo(P(0.5, -0.5))
-            path.moveTo(P(-0.05, -0.5)); path.lineTo(P(0.5, -0.5)); path.lineTo(P(0.5, 0.05))
-        elif name == "note":
-            path.addEllipse(P(-0.25, 0.4), 0.26 * u, 0.19 * u)
-            path.moveTo(P(0.0, 0.38)); path.lineTo(P(0.0, -0.6)); path.quadTo(P(0.2, -0.25), P(0.5, -0.15))
-        elif name == "timer":
-            path.addEllipse(P(0, 0.08), 0.55 * u, 0.55 * u)
-            path.moveTo(P(0, 0.08)); path.lineTo(P(0, -0.3)); path.moveTo(P(0, 0.08)); path.lineTo(P(0.25, 0.2))
-            path.moveTo(P(-0.15, -0.72)); path.lineTo(P(0.15, -0.72))
-        elif name == "screen":
-            path.addRoundedRect(Rc(-0.62, -0.5, 1.24, 0.82), 0.1 * u, 0.1 * u)
-            path.moveTo(P(-0.28, 0.66)); path.lineTo(P(0.28, 0.66)); path.moveTo(P(0, 0.32)); path.lineTo(P(0, 0.66))
-        else:
-            return
-        p.drawPath(path)
-
-    class Overlay(QWidget):
-        def __init__(self):
-            super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool |
-                             Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
-            self.setAttribute(Qt.WA_TranslucentBackground)
-            self.setAttribute(Qt.WA_ShowWithoutActivating)
-            self.setWindowTitle("Voice assistant overlay")
-            self.resize(S, S)
-            self.state, self.alpha, self.rot, self.speed, self.phase = "listen", 0.0, 0.0, 0.6, 0.0
-            self.lv, self.raw, self.agc, self.last_lv = [0.0] * NB, [0.0] * NB, 0.25, -9.0
-            self.load, self.cpu_prev, self.t_cpu = 0.0, None, 0.0
-            self.glyph, self.g_t0, self.g_ttl = None, -9.0, 0.0
-            self.now, self.last_msg, self.t_hidden, self.is_hidden = time.monotonic(), time.monotonic(), None, False
-            self.demo_t0 = time.monotonic() if demo else None
-            self.sn = None
-            self.timer = QTimer(self)
-            self.timer.timeout.connect(self.tick)
-            self.timer.start(16)
-            self.show()
-
-        # ---- події ----
-        def attach(self, sock):
-            self.sock = sock
-            self.sn = QSocketNotifier(sock.fileno(), QSocketNotifier.Type.Read)
-            self.sn.activated.connect(self.recv)
-        def recv(self):
-            while True:
-                try:
-                    data = self.sock.recv(8192)
-                except OSError:
-                    break
-                try:
-                    self.msg(json.loads(data))
-                except ValueError:
-                    pass
-        def set_state(self, st):
-            if st != "hide" and self.is_hidden:
-                self.is_hidden, self.t_hidden = False, None
-                self.show(); self.timer.setInterval(16)
-            self.state = st
-        def msg(self, m, now=None):
-            now = self.now if now is None else now
-            self.last_msg = now
-            if "s" in m:
-                self.set_state(m["s"])
-            t = m.get("t")
-            if t == "lv":
-                src = m.get("src")
-                if (src == "mic" and self.state == "listen") or (src == "tts" and self.state == "speak"):
-                    self.raw, self.last_lv = m.get("b", self.raw), now
-            elif t == "glyph" and m.get("g"):
-                if self.is_hidden:
-                    self.is_hidden, self.t_hidden = False, None
-                    self.show(); self.timer.setInterval(16)
-                self.glyph, self.g_t0, self.g_ttl = m["g"], now, float(m.get("ttl", 1.15))
-
-        # ---- навантаження CPU ----
-        def sample_cpu(self):
-            try:
-                with open("/proc/stat") as f:
-                    v = [int(x) for x in f.readline().split()[1:9]]
-                total, idle = sum(v), v[3] + v[4]
-                if self.cpu_prev:
-                    dt_, di = total - self.cpu_prev[0], idle - self.cpu_prev[1]
-                    busy = (dt_ - di) / dt_ if dt_ > 0 else 0.0
-                    self.load += (min(1.0, busy * 2.5) - self.load) * 0.5
-                self.cpu_prev = (total, idle)
-            except Exception:
-                pass
-
-        # ---- анімація ----
-        def demo_step(self, now):
-            t = (now - self.demo_t0) % 26.0
-            if t < 0.05 and self.state == "hide":
-                self.msg({"s": "listen"}, now)
-            plan = [(0.0, {"s": "listen"}), (4.0, {"s": "think"}), (8.0, {"s": "speak"}), (12.0, {"t": "glyph", "g": "ok"}),
-                    (13.3, {"t": "glyph", "g": "err"}), (14.6, {"t": "glyph", "g": "ask"}), (15.9, {"t": "glyph", "g": "open"}),
-                    (17.2, {"t": "glyph", "g": "note"}), (18.5, {"t": "glyph", "g": "timer"}),
-                    (19.8, {"t": "glyph", "g": "screen"}), (21.1, {"t": "glyph", "g": "bang"}), (22.4, {"s": "hide"})]
-            for k, (t0, m) in enumerate(plan):
-                if self._demo_k < k and t >= t0:
-                    self._demo_k = k
-                    self.msg(m, now)
-            if t < 0.2:
-                self._demo_k = -1
-            if self.state in ("listen", "speak") and t < 12:      # «голос» для демо
-                ph = now * 7
-                b = [max(0.0, min(1.0, 0.45 + 0.4 * math.sin(ph + i * 0.55) * math.sin(now * 2.1 + i * 0.2)
-                                  - i * 0.012)) for i in range(NB)]
-                self.msg({"t": "lv", "src": "mic" if self.state == "listen" else "tts", "b": b}, now)
-
-        def step(self, dt, now):
-            self.now = now
-            if self.demo_t0 is not None:
-                self.demo_step(now)
-            if now - self.t_cpu > 0.25:
-                self.t_cpu = now; self.sample_cpu()
-            glyph_on = self.glyph and now - self.g_t0 < self.g_ttl
-            target = 0.0 if self.state == "hide" else 1.0
-            self.alpha += (target - self.alpha) * (1 - math.exp(-dt * (9 if target else 6)))
-            spd = {"listen": 0.55, "speak": 0.75, "think": 0.9 + 6.0 * self.load}.get(self.state, 0.4)
-            self.speed += (spd - self.speed) * (1 - math.exp(-dt * 2.5))
-            self.rot = (self.rot + self.speed * dt) % (2 * math.pi)
-            self.phase += dt * (1.6 + 7.0 * self.load)
-            if self.state == "think":                       # «дихання» замість голосу; сильніше при навантаженні
-                amp = 0.35 + 0.65 * self.load
-                raw = [amp * (0.45 + 0.3 * math.sin(self.phase + i * 0.5) + 0.2 * math.sin(self.phase * 1.7 - i * 0.9))
-                       for i in range(NB)]
-                scale = 1.0
-            else:
-                raw = self.raw if now - self.last_lv < 0.35 else [0.0] * NB
-                self.agc = max(max(raw), self.agc * (1 - dt * 0.25), 0.18)
-                scale = 1.0 / self.agc
-            for i in range(NB):                            # швидка атака, повільне падіння — як у cava
-                t = min(1.0, max(0.0, raw[i] * scale))
-                if t > self.lv[i]:
-                    self.lv[i] += (t - self.lv[i]) * (1 - math.exp(-dt * 30))
-                else:
-                    self.lv[i] = max(t, self.lv[i] - dt * 1.7)
-            if self.alpha < 0.012 and not glyph_on:
-                if not self.is_hidden:
-                    self.is_hidden, self.t_hidden = True, now
-                    self.hide(); self.timer.setInterval(120)
-                elif now - self.t_hidden > 4.0 and self.demo_t0 is None:
-                    QApplication.quit()                    # у спокої оверлей не займає пам'яті
-            if self.state != "hide" and now - self.last_msg > 25.0 and self.demo_t0 is None:
-                self.state = "hide"                        # страховка: події загубилися
-            self.update()
-        def tick(self):
-            now = time.monotonic()
-            self.step(min(0.05, now - self.now), now)
-
-        # ---- малювання ----
-        def paintEvent(self, _):
-            p = QPainter(self)
-            p.setRenderHint(QPainter.Antialiasing)
-            p.setCompositionMode(QPainter.CompositionMode_Source)
-            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
-            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            A, cx, cy = max(0.0, min(1.0, self.alpha)), S / 2, S / 2
-            if A > 0.004:
-                ease = 1 - (1 - A) ** 3
-                grow = 0.55 + 0.45 * ease
-                R = R0 * grow
-                hue = {"listen": 192, "speak": 160}.get(self.state, (250 + 110 * self.load) % 360)
-                p.setPen(Qt.NoPen)
-                for i in range(ND):
-                    a = self.rot + 2 * math.pi * i / ND
-                    v = self.lv[int(abs(i / ND * 2 - 1) * (NB - 1) + 0.5)]
-                    r = R + v * 44 * UI_SCALE * grow
-                    x, y = cx + r * math.cos(a), cy + r * math.sin(a)
-                    size = (2.3 + v * 3.6) * UI_SCALE * grow
-                    col = QColor.fromHsvF(((hue + 45 * i / ND) % 360) / 360, 0.55, 1.0, 1.0)
-                    col.setAlphaF(A * (0.42 + 0.58 * v))
-                    glow = QColor(col); glow.setAlphaF(A * (0.10 + 0.14 * v))
-                    p.setBrush(glow); p.drawEllipse(QPointF(x, y), size * 2.5, size * 2.5)
-                    p.setBrush(col); p.drawEllipse(QPointF(x, y), size, size)
-            age = self.now - self.g_t0
-            if self.glyph and age < self.g_ttl:
-                ga = min(age / 0.12, 1.0) * min((self.g_ttl - age) / 0.3, 1.0)
-                c = QColor(255, 255, 255); c.setAlphaF(max(0.0, min(1.0, ga)) * 0.95)
-                p.save(); p.translate(cx, cy)
-                draw_glyph(p, self.glyph, R0 * 0.36, c)
-                p.restore()
-            elif A > 0.05 and self.state in ("listen", "think", "speak"):   # маленький «пульс» у центрі
-                c = QColor(255, 255, 255); c.setAlphaF(A * (0.35 + 0.25 * math.sin(self.phase * 2)))
-                p.setPen(Qt.NoPen); p.setBrush(c)
-                p.drawEllipse(QPointF(cx, cy), 3.2 * UI_SCALE, 3.2 * UI_SCALE)
-            p.end()
-
-    app = QApplication(sys.argv[:1])
-    app.setApplicationName("voice-assistant-overlay")
-    QGuiApplication.setDesktopFileName("voice-assistant-overlay")   # app_id для правил Hyprland
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    UI_SOCK.unlink(missing_ok=True)
-    sock.bind(str(UI_SOCK)); sock.setblocking(False)
-    ov = Overlay()
-    ov.attach(sock)
-    try:
-        app.exec()
-    finally:
-        UI_SOCK.unlink(missing_ok=True)
-
 
 def _hyprctl(args, timeout=1.5):
     if not shutil.which("hyprctl"):
@@ -3099,8 +2983,6 @@ def run_overlay(demo=False):
     """Талісман-оверлей: живий бот з очима й ротом на прозорому екрані-вікні. Слухає — великі очі й хвилі від голосу;
     думає — очі блукають; говорить — рот у такт голосу; тримається біля активного вікна, блукає сам або йде за командою.
     Відповіді — коміксна бульбашка, дані — картки/картинки/QR, емоції — знаки й слова над головою."""
-    if UI_STYLE == "ring":
-        return run_overlay_ring(demo)
     os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
     os.environ.setdefault("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.services=false")
@@ -3591,7 +3473,7 @@ def run_overlay(demo=False):
 
         # ---- анімація ----
         def target_pos(self, now):
-            hw, hh, ant = self.dims()
+            hw, hh, _ = self.dims()
             R = hw + 16 * sc
             if self.mode == "follow":
                 w = self.win
@@ -3741,7 +3623,6 @@ def run_overlay(demo=False):
                 p.setBrush(QColor(255, 255, 255, 190)); p.drawEllipse(QPointF(cx - ew * 0.3, cy - h * 0.2), ew * 0.28, ew * 0.28)
             if e in ("sad", "angry", "think"):               # повіко-«шторка» кольору екрана
                 lid = QColor("#0b0f18")
-                inner = -side                                # напрям до центру обличчя
                 if e == "think":
                     a_out = a_in = 0.34
                 elif e == "angry":
@@ -3807,7 +3688,7 @@ def run_overlay(demo=False):
                 return
             if ORB:
                 return self.draw_orb(p, now, A)
-            pop = 1.0 + 0.0 if A >= 0.99 else (1 - (1 - A) ** 3) * 1.0
+            pop = 1.0 if A >= 0.99 else 1 - (1 - A) ** 3
             e = self.emo if now < self.emo_until else {"think": "think", "idle": "neutral"}.get(self.state, "neutral")
             if e == "neutral" and self.state == "think":
                 e = "think"
@@ -3875,7 +3756,7 @@ def run_overlay(demo=False):
 
         def draw_fx(self, p, now, A, bob, tvmode):
             """Знаки, слова й «думаю» поряд із персонажем (без нахилу)."""
-            hw, hh, ant = self.dims()
+            hw, hh, _ = self.dims()
             sd = self.side()
             if self.state == "think" and not self.fx and not tvmode:
                 draw_sign(p, "dots", self.x + sd * (hw + 30 * sc), self.y + bob - hh * 0.8, 8 * sc, now)
@@ -3945,7 +3826,6 @@ def run_overlay(demo=False):
             else:
                 bands = [0.0] * UI_BANDS
             nb = len(bands)
-            level = min(1.0, (sum(bands) / nb) * 2.4)
             pulse_e = 1.0 + (0.25 * math.exp(-(now - (self.emo_until - 1.6)) * 4) if e in ("joy", "surprise") and self.emo_until - now < 1.6 else 0.0)
             u_ = HW / 58.0                                   # одиниці ескізу -> пікселі
             RS_, NT_, RV = 10.0, ORB_NT, 36.0
@@ -4081,7 +3961,7 @@ def run_overlay(demo=False):
                 w, h = measure(b["text"], fnt, maxw)
                 b["size"] = (min(maxw, w) + 2 * pad, h + 2 * pad)
             bw, bh = b["size"]
-            hw, hh, ant = self.dims()
+            _, hh, ant = self.dims()
             above = self.y - hh - ant - 34 * sc - bh > 10
             bx = max(10, min(self.W - bw - 10, self.x - bw / 2 + (bw * 0.18 if self.x < self.W / 2 else -bw * 0.18)))
             by = (self.y - hh - ant - 34 * sc - bh) if above else (self.y + hh + 44 * sc)
@@ -4120,7 +4000,6 @@ def run_overlay(demo=False):
             p.setPen(pen); p.setBrush(fillc); p.drawPath(path)
             if style == "think":
                 for i, (r_, f_) in enumerate(((7, 0.35), (5, 0.7), (3.4, 1.0))):
-                    px_ = self.x + (tipx - self.x) * 0 + (rc.center().x() - self.x) * 0.0
                     cy_ = (rc.bottom() + (tipy - rc.bottom()) * f_) if above else (rc.top() + (tipy - rc.top()) * f_)
                     cx_ = rc.center().x() + (self.x - rc.center().x()) * f_
                     p.setBrush(fillc); p.drawEllipse(QPointF(cx_, cy_), r_ * sc, r_ * sc)
@@ -4500,23 +4379,21 @@ class CmdRecognizer:
             return "final", t
         return "partial", self.last
 
-_JARVIS_FORMS = ("джарвіс", "джарвис", "жарвіс", "чарвіс", "джервіс", "ярвіс", "харвіс", "гарвіс", "джарвіз", "джарвес", "jarvis")
-WAKE_FORMS = _JARVIS_FORMS if re.search(r"джарв|jarvis", WAKE.lower()) else ()    # типові «перекручення» є лише для Jarvis; інше ім'я — з wake.words/aliases
 WAKE_FILLERS = {"хей", "hey", "гей", "ей", "хай", "хєй", "хеей"}
 
 def _wk(tok):
     return re.sub(r"[^\w']", "", tok.lower())
 
 def wake_prefix_len(tokens, strict=True):
-    """Скільки перших слів — ключове слово («хей джарвіс», «джар віс»); 0, якщо фраза з нього не починається.
-    Збіг нечіткий: Vosk і whisper по-різному «чують» англійське Jarvis українською вимовою."""
+    """Скільки перших слів — ключове слово («хей квазар», «ква зар»); 0, якщо фраза з нього не починається.
+    Збіг нечіткий: Vosk і whisper по-різному записують одне й те саме слово."""
     cut = 0.78 if strict else 0.7
-    forms = {f for f in set(WAKE_FORMS) | {w.strip().lower() for w in WAKE.split(",") if w.strip()} | set(WAKE_ALIASES)
+    forms = {f for f in {w.strip().lower() for w in WAKE.split(",") if w.strip()} | set(WAKE_ALIASES)
              if len(f) >= 4 and " " not in f}
     toks = [_wk(t) for t in tokens[:3]]
     i = 1 if toks and toks[0] in WAKE_FILLERS else 0
     best = (0.0, 0)
-    for n in (1, 2):                             # «джарвіс» або «джар віс»: вибираємо найточніший варіант
+    for n in (1, 2):                             # «квазар» або «ква зар»: вибираємо найточніший варіант
         if len(toks) >= i + n:
             cand = "".join(toks[i:i + n])
             if len(cand) >= 4:
@@ -4540,7 +4417,7 @@ def drop_wake_words(text, words, t_cut):
     return " ".join(toks[n:])
 
 def _wake_forms():
-    return {f for f in set(WAKE_FORMS) | {w.strip().lower() for w in WAKE.split(",") if w.strip()} | set(WAKE_ALIASES)
+    return {f for f in {w.strip().lower() for w in WAKE.split(",") if w.strip()} | set(WAKE_ALIASES)
             if len(f) >= 4 and " " not in f}
 
 def wake_residue(text):
@@ -4749,7 +4626,7 @@ def vision_test():
 
 def classify(t):
     t = t.lower()
-    need = bool(TOOLS_RE.search(t))
+    need = bool(TOOLS_RE.search(t)) or any(rx.search(t) for rx in PLUGIN_TRIGGERS)
     if SMART_RE.search(t) or len(t) > 160:
         return "smart", need
     return ("tools" if need else "fast"), need
@@ -4800,6 +4677,8 @@ def system_prompt(need_tools, can_escalate, screen=False):
 def tool_clip(name, args, res):
     if str(res).startswith("помилка"):
         return "помилка"
+    if name in PLUGIN_META:
+        return PLUGIN_META[name]["clip"]
     if name == "play_media":
         return "відкриваю"
     if name in ("open_app", "open_url", "edit_file") or (name == "files" and args.get("action") == "open"):
@@ -4815,6 +4694,8 @@ def tool_clip(name, args, res):
 def needs_followup(name, args):
     """Інструменти, що повертають інформацію: LLM має її прочитати й відповісти (або продовжити)."""
     a = args.get("action")
+    if name in PLUGIN_META:
+        return PLUGIN_META[name]["followup"]
     return (name in ("system_status", "get_text", "web_search", "web_fetch")
             or (name == "shell" and not args.get("background"))
             or (name == "player" and a == "status") or (name == "note" and a == "read")
@@ -4953,6 +4834,7 @@ def handle(client, speaker, text):
         print("Нічого не розпізнано."); speaker.clip("не_зрозумів"); speaker.wait(); return
     text = heal_apps(text)
     print(f"› {text}")
+    emit("heard", text)
     proto = match_protocol(text)
     if proto:
         run_protocol(proto, speaker); return
@@ -5002,8 +4884,9 @@ def handle(client, speaker, text):
             speaker.clip("помилка"); speaker.wait(); return
         final = offline(speaker, text, hist)
     if final:                      # була озвучена відповідь (для дій — лише звук, без тексту)
+        emit("reply", final)
         # текст уже з'явився в бульбашці речення за реченням (Speaker.say); сповіщення — лише якщо оверлею немає
-        if not (UI_BUBBLE and UI_STYLE == "mascot" and ui(t="ping")):
+        if not (UI_BUBBLE and ui(t="ping")):
             notify("Асистент", clean(final))
         save_history(hist, text, final)
     speaker.wait()
@@ -5089,6 +4972,15 @@ def light_ok(text):
     """Усі частини фрази — прості локальні команди (пробний прохід без дій)?"""
     return all(would_run_local(p, True) for p in split_commands(text))
 
+def trim_memory():
+    """Повернути системі пам'ять, яку звільнили Python і C++ (після завантаження моделей, після воркера)."""
+    import gc, ctypes
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
 def daemon(speaker):
     """Легкий слухач. Стани: idle (openWakeWord + Vosk слухають ключове слово) -> cmd (Vosk слухає команду)
     -> worker (звук іде воркеру). Воркер після відповіді лишається «теплим» і бере наступну команду миттєво."""
@@ -5098,6 +4990,7 @@ def daemon(speaker):
     PID_FILE.write_text(str(os.getpid()))
     wake, cmdrec, mic, uih = make_wake(), CmdRecognizer(), Mic(), UiProc()
     uih.ensure_idle()
+    trim_memory()
     if OUTPUT != "speakers":
         ensure_virtual_mic()                    # щоб вузол одразу був у списку мікрофонів
     worker = warm = None
@@ -5122,6 +5015,7 @@ def daemon(speaker):
             else:
                 worker.kill()
         worker = None
+        trim_memory()
         mic.drain(); wake.reset(); cmdrec.reset()
         if read_mode() != ACTIVE_MODE:          # режим могли змінити окремі процеси (протокол)
             apply_mode(read_mode())
@@ -5145,6 +5039,7 @@ def daemon(speaker):
         """Ключове слово почуте (або гаряча клавіша): чекаємо команду. Без команди за ~1.2 с — звук «слухаю»."""
         nonlocal state, deadline, prompt_at, cmd_chunks, worker, wake_cut, wake_t
         wake_t = 0.0 if prompt_now else time.monotonic()
+        emit("wake")
         uih.open()
         if prompt_now:                           # гаряча клавіша: звук, потім чистий запис без власного відлуння
             speaker.clip("слухаю"); speaker.wait(); ui(s="listen"); mic.drain()
@@ -5192,6 +5087,7 @@ def daemon(speaker):
             return
         if light_ok(cmd):                        # усе зрозуміло локально: воркер не потрібен
             kill_worker()
+            emit("heard", cmd)
             local_multi(speaker, cmd, light=True)
             print(f"› {cmd}\n  ⚡ виконано локально", file=sys.stderr)
             speaker.wait(); to_idle(); return
@@ -5402,7 +5298,7 @@ speaker = "остап"                        # остап | поліна — Ed
 # api_model = "gpt-4o-mini-tts"
 
 # Готові голоси: остап, поліна (Edge) · диктор, бас (низькі варіанти Остапа) · жвава, спокійна (варіанти Поліни)
-# · лада, микита, тетяна (Piper, офлайн). Змінити голосом: «Джарвіс, голос поліна». Свій варіант:
+# · лада, микита, тетяна (Piper, офлайн). Змінити голосом: «<слово>, голос поліна». Свій варіант:
 # [voices."диктор2"]
 # engine = "edge"                        # edge | piper | openai
 # id = "uk-UA-OstapNeural"               # для piper: lada | mykyta | tetiana
@@ -5413,11 +5309,11 @@ speaker = "остап"                        # остап | поліна — Ed
 [ui]                                     # оверлей: персонаж-талісман
 enabled = true
 scale = 1.0                              # розмір талісмана
-# style = "mascot"                       # mascot — живий бот з очима; ring — коло з точок
 # idle = "show"                          # show: талісман живе на екрані (блукає, спить); hide: зʼявляється лише на розмову
 # move = "follow"                        # follow — біля активного вікна; wander — блукає сам; stay — стоїть (голосом можна змінити)
 # look = "bot"                          # bot — робот з очима; orb — «чорна діра» з точок і кільце-індикатор
 # bubble = true                          # відповідь у коміксній бульбашці замість сповіщення
+# command = "python3 ~/ui/my_ui.py"      # СВІЙ інтерфейс замість талісмана: процес слухає сокет $ASSISTANT_UI_SOCK (протокол — README)
 
 [screen]
 max_side = 1600                          # довша сторона знімка екрана, px
@@ -5476,6 +5372,13 @@ zen = ["зен", "мозоку"]
 # ]
 # [protocols."кіно"]
 # disabled = true                                 # вимкнути вбудований протокол
+
+# ПЛАГІНИ — свої інструменти, команди й реакції на події: *.py у plugins/ (поруч зі скриптом) або ~/.config/voice-assistant/plugins/
+# (приклад: plugins/_example.py). Налаштування плагіна — [plugins.назва], вимкнути без видалення:
+# [plugins]
+# disabled = ["hello"]
+# [plugins.hello]
+# name = "Саша"
 
 # РЕЖИМИ — стани, що змінюють поведінку, поки активні: «режим тиша», «вимкни режим».
 # Вбудовані: тиша (без голосу й звуків), гра (тиша + без оверлею), приватність (лише локальні
@@ -5562,6 +5465,9 @@ def doctor():
         bad = validate_protocol(name, p)
         row(BAD if bad else OK, name, "; ".join(bad) if bad else f"{len(p['steps'])} кроків")
     print(f"\nРежими: {', '.join(MODES)}   (зараз: {ACTIVE_MODE or 'звичайний'})")
+    print(f"Плагіни: {', '.join(PLUGINS_LOADED) or 'немає'}   (теки: {', '.join(str(d) for d in PLUGIN_DIRS)})")
+    if UI_CMD:
+        print(f"Свій інтерфейс: {UI_CMD}")
 
 def ensure_voice_path():
     p = E("PIPER_MODEL", "")
@@ -5571,7 +5477,7 @@ def voices_main():
     cur = pick_voice()
     desc = {"edge": "Edge, хмарний нейронний (найякісніший, потрібен інтернет)", "piper": "Piper, локальний (офлайн)",
             "openai": "API /audio/speech"}
-    print("Голоси (змінити: «Джарвіс, голос поліна» або speaker у config.toml):")
+    print("Голоси (змінити: «<слово>, голос поліна» або speaker у config.toml):")
     for n, (eng, _) in VOICES.items():
         print(f"  {voice_title(n):10} {desc[eng]}" + ("   ← зараз" if n == cur else ""))
     print("\nБудь-який голос Edge — за повною назвою (speaker = \"uk-UA-PolinaNeural\"). Перевірка: --speak \"привіт\" --voice лада")
@@ -5634,6 +5540,8 @@ def main():
     a = ap.parse_args()
     if not (a.ui or a.ui_demo or a.check or a.vision_test):
         quiet_native_stderr()
+    if not (a.ui or a.ui_demo or a.init_config):
+        load_plugins()
     if a.protocol:
         protocol_main(a.protocol, a.dry); return
     if a.voices:

@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Шпаргалка: голосовий асистент</title><style>:root{--bg:#fff;--fg:#1d2330;--mut:#5b6577;--line:#d9dee8;--th:#f1f4f9;--code:#eef1f6;--acc:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e6e9ef;--mut:#9aa4b5;--line:#2b3140;--th:#1c212b;--code:#222836;--acc:#7aa2ff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans","DejaVu Sans",sans-serif}
+main{max-width:980px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:28px;margin:0 0 8px}h2{font-size:19px;margin:34px 0 10px;padding-top:6px;border-top:1px solid var(--line);color:var(--acc)}
+p{margin:8px 0}code{background:var(--code);padding:1px 5px;border-radius:4px;font:13px ui-monospace,"JetBrains Mono","DejaVu Sans Mono",monospace;white-space:pre-wrap}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;margin:10px 0}th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:var(--th)}tr:nth-child(even) td{background:color-mix(in srgb,var(--th) 45%,transparent)}
+@media print{:root{--bg:#fff;--fg:#000}h2{break-after:avoid}tr{break-inside:avoid}}</style></head><body><main><h1>Шпаргалка: голосовий асистент</h1>
+<p>Ключове слово: <strong>«Оріон»</strong> (або <strong>«Hey Orion»</strong>). Команду можна казати в тій самій фразі: «Оріон, відкрий steam». Лише ключове слово — пролунає «слухаю», далі говори команду.</p>
+<h2>1. Запуск і CLI</h2>
+<p>Усі команди: <code>uv run --managed-python assistant.py …</code></p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Команда</th>
+<th>Що робить</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--daemon</code></td>
+<td>основний режим: слухає ключове слово</td>
+</tr>
+<tr>
+<td><em>(без аргументів)</em></td>
+<td>один раз послухати й вийти, без ключового слова</td>
+</tr>
+<tr>
+<td><code>"текст"</code></td>
+<td>текстовий режим: <code>assistant.py "що ти вмієш"</code></td>
+</tr>
+<tr>
+<td><code>--init-config</code></td>
+<td>створити <code>config.toml</code> з поясненнями</td>
+</tr>
+<tr>
+<td><code>--check</code></td>
+<td>перевірити пакети, програми, API, моделі, звуки</td>
+</tr>
+<tr>
+<td><code>--wake-test</code></td>
+<td>оцінка openWakeWord, що чує Vosk, рівень мікрофона</td>
+</tr>
+<tr>
+<td><code>--vision-test</code></td>
+<td>які моделі справді бачать зображення</td>
+</tr>
+<tr>
+<td><code>--ui-demo</code></td>
+<td>показати оверлей у всіх станах</td>
+</tr>
+<tr>
+<td><code>--protocol НАЗВА [--dry]</code></td>
+<td>виконати протокол без голосу (<code>--dry</code> — лише показати кроки)</td>
+</tr>
+<tr>
+<td><code>--voices</code></td>
+<td>список голосів</td>
+</tr>
+<tr>
+<td><code>--speak "текст" [--voice лада] [--output mic]</code></td>
+<td>перевірити голос і вивід</td>
+</tr>
+<tr>
+<td><code>--forget</code></td>
+<td>очистити історію розмови</td>
+</tr>
+<tr>
+<td><code>--mic-off</code></td>
+<td>прибрати віртуальний мікрофон</td>
+</tr>
+</tbody>
+</table></div>
+<p>Разова зміна налаштування: <code>ASSISTANT_STT=vosk uv run --managed-python assistant.py --daemon</code></p>
+<h2>2. Керування розмовою</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Дія</th>
+<th>Як</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Почати слухати без ключового слова</td>
+<td>гаряча клавіша (<code>kill -USR1</code>, у прикладі — SUPER+A)</td>
+</tr>
+<tr>
+<td>Зупинити все негайно (і відео, і трек)</td>
+<td>гаряча клавіша (<code>kill -USR2</code>, SUPER+S)</td>
+</tr>
+<tr>
+<td>Хибне спрацювання</td>
+<td>«Оріон, <strong>відбій</strong>» (відміна, забудь, не треба, нічого, помилково, це не тобі, не слухай)</td>
+</tr>
+<tr>
+<td>Перервати відповідь</td>
+<td>«Оріон, <strong>замовкни</strong>» (досить, припини, годі, вистачить)</td>
+</tr>
+<tr>
+<td>Перебити посеред відповіді</td>
+<td>скажи «Оріон» і нову команду</td>
+</tr>
+<tr>
+<td>Уточнити після відповіді</td>
+<td>ще ~5 с слухає без ключового слова: «а завтра?»</td>
+</tr>
+<tr>
+<td>Слово «стоп»</td>
+<td>поки асистент говорить — зупиняє його, в інший час — пауза музики</td>
+</tr>
+</tbody>
+</table></div>
+<h2>3. Миттєві команди (без LLM, без інтернету)</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Що</th>
+<th>Приклади</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Програми</td>
+<td>«відкрий steam», «запусти discord»</td>
+</tr>
+<tr>
+<td>Плеєр</td>
+<td>«пауза», «продовжуй», «наступний трек», «попередній»</td>
+</tr>
+<tr>
+<td>Гучність</td>
+<td>«гучність сорок», «гучніше», «тихіше»</td>
+</tr>
+<tr>
+<td>Таймер</td>
+<td>«таймер на 5 хвилин», «нагадай через 10 хвилин»</td>
+</tr>
+<tr>
+<td>Що грає</td>
+<td>«що зараз грає»</td>
+</tr>
+<tr>
+<td>Система</td>
+<td>«стан системи», «температура процесора», «скільки заряду»</td>
+</tr>
+<tr>
+<td>Клавіші</td>
+<td>«натисни ентер / ескейп / таб», «скасуй», «збережи», «скопіюй», «встав», «виріж», «виділи все», «видали виділене»</td>
+</tr>
+<tr>
+<td>Сон комп'ютера</td>
+<td>«режим сну» (після твого «так»)</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Кілька команд в одній фразі</strong> — розділяй «і», «та», «потім», «затим» або комою:
+«Оріон, відкрий steam і discord, зроби гучність сорок, потім постав таймер на п'ять хвилин». Те, чого він не розуміє, віддається LLM; решта все одно виконується.</p>
+<h2>4. Писати й читати</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Фраза</th>
+<th>Результат</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>«надрукуй привіт» (набери, введи, диктуй)</td>
+<td>вводить сказане дослівно в активне вікно</td>
+</tr>
+<tr>
+<td>«напиши відповідь на цей лист»</td>
+<td>LLM складає текст і вводить його</td>
+</tr>
+<tr>
+<td>«прочитай виділене» / «прочитай буфер»</td>
+<td>озвучує виділений / скопійований текст</td>
+</tr>
+<tr>
+<td>«підсумуй виділене»</td>
+<td>LLM: стисло, переклад, пояснення</td>
+</tr>
+<tr>
+<td>«запиши нотатку …»</td>
+<td>дописує рядок із часом у <code>~/Documents/voice-notes.md</code></td>
+</tr>
+<tr>
+<td>«прочитай нотатки»</td>
+<td>озвучує останні 5</td>
+</tr>
+<tr>
+<td>«скажи в мікрофон …» / «скажи за мене …»</td>
+<td>озвучує фразу лише у віртуальний мікрофон (дзвінок)</td>
+</tr>
+</tbody>
+</table></div>
+<h2>5. Питання про екран</h2>
+<p>«що на екрані?», «подивись сюди», «що це за помилка», «що в мене відкрито», «прочитай це».
+Назви програму чи гру («що в грі», «що в дискорді») — знімається саме її вікно; без назви — усі монітори (до 3). Потрібен <code>grim</code>.</p>
+<h2>6. Талісман на екрані</h2>
+<p>Вигляд: <code>[ui] look = "bot"</code> (робот) або <code>"orb"</code> (чорна діра).</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Що</th>
+<th>Команди</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Рух</td>
+<td>«перейди в правий нижній кут», «стань справа / зліва / по центру», «підійди до курсора», «іди за вікном», «гуляй», «залишайся тут»</td>
+</tr>
+<tr>
+<td>Видимість</td>
+<td>«сховайся» (з'являється лише на розмову), «з'явись»</td>
+</tr>
+<tr>
+<td>Картки (миттєво)</td>
+<td>«що ти вмієш показувати», «покажи скріншот», «покажи стан системи», «покажи вікна», «покажи нотатки», «прибери картку»</td>
+</tr>
+<tr>
+<td>Ефект</td>
+<td>«зроби бах»</td>
+</tr>
+<tr>
+<td>Через LLM (потрібен інтернет)</td>
+<td>«знайди в інтернеті … і покажи», «покажи qr для https://…», «покажи картинку ~/Pictures/файл.png», «покажи, як виглядає сайт …», «покажи таблицю …»</td>
+</tr>
+</tbody>
+</table></div>
+<p>Режими руху: <strong>follow</strong> (біля активного вікна, типово), <strong>wander</strong> (блукає), <strong>stay</strong> (стоїть). Режим і позиція запам'ятовуються.</p>
+<h2>7. Відео, треки, меми</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Що</th>
+<th>Команди</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Трек</td>
+<td>«постав трек Океан Ельзі Обійми», «увімкни пісню Imagine Dragons Believer»</td>
+</tr>
+<tr>
+<td>Відео</td>
+<td>«пусти кліп Despacito», «покажи відео про котів», посилання або файл із домашньої теки</td>
+</tr>
+<tr>
+<td>Керування</td>
+<td>«пауза», «продовжуй», «стоп» (годі, досить, вистачить, замовкни, прибери відео)</td>
+</tr>
+<tr>
+<td>Меми</td>
+<td>«покажи мем», «ще мем»</td>
+</tr>
+<tr>
+<td>Свій мем</td>
+<td>«зроби мем про те, що код працює, а я не знаю чому»</td>
+</tr>
+</tbody>
+</table></div>
+<p>Коли кажеш «Оріон», музика ставиться на паузу й сама продовжується після відповіді. «Увімкни музику» без назви керує Spotify/браузером (MPRIS). Для YouTube потрібен <code>deno</code> або <code>nodejs</code> у PATH.</p>
+<h2>8. Що ще вміє LLM-режим</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Область</th>
+<th>Приклади</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Файли</td>
+<td>«що в теці Documents», «прочитай файл notes.txt», «створи файл план.txt з текстом …», «знайди файл про борщ», «видали файл …» (у кошик, після «так»)</td>
+</tr>
+<tr>
+<td>Інтернет</td>
+<td>«знайди в інтернеті, яка погода у Львові», «прочитай першу сторінку»</td>
+</tr>
+<tr>
+<td>Вікна</td>
+<td>«перейди на другий стіл», «перенеси вікно на п'ятий», «закрий вікно», «на весь екран», «які вікна відкриті»</td>
+</tr>
+<tr>
+<td>Система</td>
+<td>яскравість, «вимкни звук», «вимкни мікрофон», wifi, bluetooth, «заблокуй екран», скріншот</td>
+</tr>
+<tr>
+<td>Інше</td>
+<td>будь-яка команда оболонки: «скільки вільно на диску», «запусти firefox у приватному режимі»</td>
+</tr>
+</tbody>
+</table></div>
+<h2>9. Режими</h2>
+<p>Кажи «режим &lt;назва&gt;», «увімкни режим гри», «вимкни режим» або «звичайний режим». Зберігається між перезапусками.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Режим</th>
+<th>Що змінює</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>тиша</td>
+<td>без голосу й звуків, оверлей лишається</td>
+</tr>
+<tr>
+<td>гра</td>
+<td>тиша + без оверлею й талісмана</td>
+</tr>
+<tr>
+<td>приватність</td>
+<td>лише локальні команди: до LLM нічого не йде, знімків екрана немає</td>
+</tr>
+<tr>
+<td>мікрофон</td>
+<td>голос чутно і тобі, і у віртуальному мікрофоні</td>
+</tr>
+<tr>
+<td>ефір</td>
+<td>голос лише у віртуальному мікрофоні</td>
+</tr>
+</tbody>
+</table></div>
+<p>Свій режим: <code>[modes."ніч"]</code> з <code>voice</code>, <code>ui</code>, <code>private</code>, <code>volume</code>.</p>
+<h2>10. Протоколи</h2>
+<p>Кажи «протокол &lt;назва&gt;» або фразу-тригер цілою фразою. Працюють без whisper і LLM, тому швидко й офлайн.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Протокол</th>
+<th>Тригер</th>
+<th>Що робить</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>вечірка</td>
+<td>—</td>
+<td>гучність 65, Spotify, пауза 3 с, музика</td>
+</tr>
+<tr>
+<td>фокус</td>
+<td>«працюємо»</td>
+<td>гучність 20, таймер 25 хв, режим «тиша»</td>
+</tr>
+<tr>
+<td>перерва</td>
+<td>«перерва»</td>
+<td>режим вимкнено, музика на паузі, таймер 10 хв</td>
+</tr>
+<tr>
+<td>кіно</td>
+<td>«кіно»</td>
+<td>пауза, гучність 45, режим «тиша»</td>
+</tr>
+<tr>
+<td>гра</td>
+<td>«граємо»</td>
+<td>Steam і Discord, гучність 50, режим «гра»</td>
+</tr>
+<tr>
+<td>добраніч</td>
+<td>«добраніч»</td>
+<td>пауза, гучність 15, режим «тиша»</td>
+</tr>
+<tr>
+<td>доповідь</td>
+<td>«доповідь»</td>
+<td>час, стан системи, що грає</td>
+</tr>
+</tbody>
+</table></div>
+<p>Кроки власного протоколу (рівно одна дія в кроці): <code>say</code>, <code>sound</code>, <code>app</code>, <code>url</code>, <code>player</code>, <code>volume</code>, <code>timer</code> (<code>"25m"</code>, <code>"1h30m"</code>), <code>status</code>, <code>playing</code>, <code>time</code>, <code>notify</code>, <code>wait</code>, <code>mode</code>, <code>run</code>.
+Перегляд без виконання: <code>--protocol вечірка --dry</code>.</p>
+<h2>11. Голоси й віртуальний мікрофон</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Що</th>
+<th>Як</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Список</td>
+<td>«які у тебе голоси» або <code>--voices</code></td>
+</tr>
+<tr>
+<td>Змінити</td>
+<td>«Оріон, голос поліна» (запам'ятовується)</td>
+</tr>
+<tr>
+<td>Edge (потрібен інтернет)</td>
+<td>остап, поліна, диктор, бас, жвава, спокійна</td>
+</tr>
+<tr>
+<td>Piper (локально)</td>
+<td>лада, микита, тетяна</td>
+</tr>
+<tr>
+<td>Вивід</td>
+<td><code>voice.output</code>: <code>speakers</code> / <code>mic</code> / <code>both</code></td>
+</tr>
+<tr>
+<td>Вхід у Discord, OBS</td>
+<td>у програмі вибери «Assistant Microphone»</td>
+</tr>
+</tbody>
+</table></div>
+<h2>12. Безпека команд оболонки (<code>behavior.shell</code>)</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Значення</th>
+<th>Поведінка</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ask</code> (типово)</td>
+<td>питає «Виконати: …?» перед кожною командою, крім безпечного читання; відповідай «так»</td>
+</tr>
+<tr>
+<td><code>allow</code></td>
+<td>питає лише про небезпечне: rm, sudo, mv, chmod, kill, вимкнення, запис у /etc</td>
+</tr>
+<tr>
+<td><code>off</code></td>
+<td>команд оболонки немає</td>
+</tr>
+</tbody>
+</table></div>
+<p>Завжди з підтвердженням: перезапис файлу, видалення, сон. Файли доступні лише в домашній теці.</p>
+<h2>13. Налаштування, які потрібні найчастіше</h2>
+<p>Порядок пошуку <code>config.toml</code>: <code>$ASSISTANT_CONFIG</code> → поруч зі скриптом → <code>~/.config/voice-assistant/config.toml</code>. Пріоритет: змінна середовища &gt; config.toml &gt; типове. Зміни діють після перезапуску.</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Ключ</th>
+<th>Навіщо</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wake.threshold</code></td>
+<td>0..1: менше — чутливіше (типово 0.25)</td>
+</tr>
+<tr>
+<td><code>wake.aliases</code></td>
+<td>варіанти слова, які чує Vosk («джервіс», «чарвіс»)</td>
+</tr>
+<tr>
+<td><code>wake.mic_threshold</code></td>
+<td>поріг гучності мікрофона</td>
+</tr>
+<tr>
+<td><code>stt.backend</code>, <code>stt.whisper_model</code>, <code>stt.threads</code></td>
+<td>точність проти швидкості й нагріву</td>
+</tr>
+<tr>
+<td><code>api.url</code>, <code>api.model</code>, <code>api.model_vision</code></td>
+<td>LLM і модель із зором</td>
+</tr>
+<tr>
+<td><code>api.fallback_url</code>, <code>api.fallback_model</code></td>
+<td>локальна модель без інтернету (ollama)</td>
+</tr>
+<tr>
+<td><code>voice.speaker</code>, <code>voice.output</code>, <code>voice.cloud</code></td>
+<td>голос, куди звук, офлайн-голос</td>
+</tr>
+<tr>
+<td><code>ui.look</code>, <code>ui.idle</code>, <code>ui.move</code>, <code>ui.scale</code>, <code>ui.bubble</code></td>
+<td>талісман</td>
+</tr>
+<tr>
+<td><code>behavior.keep_warm</code>, <code>followup</code>, <code>prewarm</code>, <code>barge_in</code></td>
+<td>швидкість відповіді</td>
+</tr>
+<tr>
+<td><code>[apps]</code>, <code>[aliases]</code></td>
+<td>що відкривати голосом і як ти вимовляєш назви</td>
+</tr>
+</tbody>
+</table></div>
+<h2>14. Якщо щось не так</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Проблема</th>
+<th>Що робити</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Не спрацьовує ключове слово</td>
+<td><code>--wake-test</code>; додай слово в <code>wake.aliases</code> або зменш <code>wake.threshold</code> (0.2)</td>
+</tr>
+<tr>
+<td>Спрацьовує сам</td>
+<td>збільш <code>wake.threshold</code> (0.4–0.6); «відбій» гасить хибне спрацювання</td>
+</tr>
+<tr>
+<td>Погано розпізнає слова</td>
+<td><code>stt.whisper_model = "medium"</code> або <code>"large-v3-turbo"</code></td>
+</tr>
+<tr>
+<td>Довго відповідає</td>
+<td>дивись журнал <code>⏱</code>: «розпізнано» — whisper, «відповідь LLM» — API, «перший звук» — голос/мережа</td>
+</tr>
+<tr>
+<td>Мовчить і без оверлею</td>
+<td>можливо, режим «тиша» / «гра»: «вимкни режим»</td>
+</tr>
+<tr>
+<td>«Не бачить» екран</td>
+<td><code>--vision-test</code>, потім <code>api.model_vision</code></td>
+</tr>
+<tr>
+<td>YouTube: «Requested format is not available»</td>
+<td>додай <code>deno</code> або <code>nodejs</code> у PATH</td>
+</tr>
+<tr>
+<td>Рівень мікрофона 0.0000</td>
+<td><code>wpctl get-volume @DEFAULT_AUDIO_SOURCE@</code>, <code>wpctl status</code></td>
+</tr>
+<tr>
+<td>401 від API</td>
+<td>перевір ключ: <code>--check</code></td>
+</tr>
+<tr>
+<td>Оверлей не з'являється</td>
+<td><code>--ui-demo</code>, бібліотеки nix-ld, правило Hyprland</td>
+</tr>
+</tbody>
+</table></div>
+<h2>15. Де що лежить</h2>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Шлях</th>
+<th>Що</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sounds/</code> поруч зі скриптом</td>
+<td>свої звуки замість озвучення (<code>слухаю</code>, <code>відкриваю</code>, <code>готово</code>, <code>помилка</code>, <code>не_зрозумів</code>, <code>офлайн</code>)</td>
+</tr>
+<tr>
+<td><code>~/.config/voice-assistant/api_key</code></td>
+<td>ключ API</td>
+</tr>
+<tr>
+<td><code>~/.local/state/voice-assistant/</code></td>
+<td>історія, режим, голос, стан талісмана, кеш медіа</td>
+</tr>
+<tr>
+<td><code>~/Documents/voice-notes.md</code></td>
+<td>нотатки</td>
+</tr>
+<tr>
+<td><code>$XDG_RUNTIME_DIR/assistant.pid</code></td>
+<td>PID для гарячих клавіш</td>
+</tr>
+</tbody>
+</table></div></main></body></html>
